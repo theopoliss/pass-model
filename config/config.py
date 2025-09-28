@@ -27,11 +27,28 @@ class ModelConfig(BaseModel):
     model_type: str = Field(default="poisson", description="Type of model to use")
     features: List[str] = Field(
         default=[
+            # Position
             "position_encoded",
+
+            # Match context
             "minutes_played",
             "is_home",
+
+            # Team strength
             "team_strength_diff",
-            "opponent_strength"
+            "opponent_strength",
+
+            # Player-specific features
+            "player_career_avg_passes",
+            "player_career_avg_passes_per90",
+            "player_pass_consistency",
+            "player_games_played",
+            "player_career_completion_rate",
+
+            # Player form
+            "player_recent_passes_avg",
+            "player_recent_completion_rate",
+            "player_form_trend"
         ]
     )
     target: str = Field(default="passes_attempted")

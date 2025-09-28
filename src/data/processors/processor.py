@@ -24,6 +24,7 @@ class PassDataProcessor:
         self.exclude_goalkeepers = exclude_goalkeepers
         self.position_encoder = LabelEncoder()
         self.team_encoder = LabelEncoder()
+        self.player_stats = {}  # Store player career statistics
 
     def clean_player_data(self, df: pd.DataFrame) -> pd.DataFrame:
         """Clean player-level data.
@@ -182,6 +183,131 @@ class PassDataProcessor:
 
         return df
 
+    def calculate_player_statistics(self, df: pd.DataFrame, train_mask: Optional[pd.Series] = None) -> pd.DataFrame:
+        """Calculate player-specific statistics.
+
+        Args:
+            df: DataFrame with player data
+            train_mask: Boolean mask for training data (to avoid leakage)
+
+        Returns:
+            DataFrame with player statistics added
+        """
+        df = df.copy()
+
+        # Use only training data for calculating stats if mask provided
+        stats_df = df[train_mask] if train_mask is not None else df
+
+        # Calculate player career statistics
+        player_stats = stats_df.groupby('player').agg({
+            'passes_attempted': ['mean', 'std', 'count'],
+            'minutes_played': 'mean',
+            'passes_completed': 'mean'
+        })
+
+        # Flatten column names
+        player_stats.columns = ['_'.join(col).strip() for col in player_stats.columns]
+        player_stats.rename(columns={
+            'passes_attempted_mean': 'player_career_avg_passes',
+            'passes_attempted_std': 'player_pass_consistency',
+            'passes_attempted_count': 'player_games_played',
+            'minutes_played_mean': 'player_avg_minutes',
+            'passes_completed_mean': 'player_career_avg_completed'
+        }, inplace=True)
+
+        # Normalize per 90 minutes
+        player_stats['player_career_avg_passes_per90'] = (
+            player_stats['player_career_avg_passes'] / player_stats['player_avg_minutes'] * 90
+        )
+        player_stats['player_career_completion_rate'] = (
+            player_stats['player_career_avg_completed'] / player_stats['player_career_avg_passes']
+        ).clip(0, 1)
+
+        # Calculate position group averages for fallback
+        position_stats = stats_df.groupby('position_group').agg({
+            'passes_attempted': 'mean',
+            'passes_completed': 'mean',
+            'minutes_played': 'mean'
+        }).rename(columns={
+            'passes_attempted': 'position_avg_passes',
+            'passes_completed': 'position_avg_completed',
+            'minutes_played': 'position_avg_minutes'
+        })
+
+        # Merge player stats
+        df = df.merge(player_stats[['player_career_avg_passes', 'player_pass_consistency',
+                                     'player_games_played', 'player_career_avg_passes_per90',
+                                     'player_career_completion_rate']],
+                      left_on='player', right_index=True, how='left')
+
+        # Merge position stats for fallback
+        df = df.merge(position_stats, left_on='position_group', right_index=True, how='left')
+
+        # Handle new/unseen players with position-based fallback
+        df['player_career_avg_passes'] = df['player_career_avg_passes'].fillna(df['position_avg_passes'])
+        df['player_pass_consistency'] = df['player_pass_consistency'].fillna(
+            df.groupby('position_group')['passes_attempted'].transform('std')
+        )
+        df['player_games_played'] = df['player_games_played'].fillna(0)
+        df['player_career_avg_passes_per90'] = df['player_career_avg_passes_per90'].fillna(
+            df['position_avg_passes'] / df['position_avg_minutes'] * 90
+        )
+        df['player_career_completion_rate'] = df['player_career_completion_rate'].fillna(
+            df['position_avg_completed'] / df['position_avg_passes']
+        )
+
+        # Create experience level feature
+        df['player_experience_level'] = pd.cut(
+            df['player_games_played'],
+            bins=[-0.1, 5, 15, 30, np.inf],
+            labels=['new', 'developing', 'experienced', 'veteran']
+        )
+
+        # One-hot encode experience level
+        experience_dummies = pd.get_dummies(df['player_experience_level'], prefix='exp')
+        df = pd.concat([df, experience_dummies], axis=1)
+
+        # Drop temporary columns
+        df = df.drop(columns=['position_avg_passes', 'position_avg_completed', 'position_avg_minutes'])
+
+        return df
+
+    def add_player_form_features(self, df: pd.DataFrame, window: int = 5) -> pd.DataFrame:
+        """Add player-specific form features.
+
+        Args:
+            df: DataFrame sorted by player and date
+            window: Number of games for form calculation
+
+        Returns:
+            DataFrame with player form features
+        """
+        df = df.sort_values(['player', 'match_date']).copy()
+
+        # Calculate player-specific recent form
+        df['player_recent_passes_avg'] = (
+            df.groupby('player')['passes_attempted']
+            .transform(lambda x: x.rolling(window, min_periods=1).mean().shift(1))
+        )
+
+        df['player_recent_completion_rate'] = (
+            df.groupby('player')['passes_completed']
+            .transform(lambda x: x.rolling(window, min_periods=1).mean().shift(1)) /
+            df.groupby('player')['passes_attempted']
+            .transform(lambda x: x.rolling(window, min_periods=1).mean().shift(1))
+        ).clip(0, 1)
+
+        # Calculate form trend (recent vs career average)
+        df['player_form_trend'] = (
+            df['player_recent_passes_avg'] / df['player_career_avg_passes'].replace(0, 1)
+        ).fillna(1.0)
+
+        # Fill NaN values with career averages
+        df['player_recent_passes_avg'] = df['player_recent_passes_avg'].fillna(df['player_career_avg_passes'])
+        df['player_recent_completion_rate'] = df['player_recent_completion_rate'].fillna(df['player_career_completion_rate'])
+
+        return df
+
     def create_model_features(self, df: pd.DataFrame) -> Tuple[pd.DataFrame, List[str]]:
         """Create final features for modeling.
 
@@ -206,6 +332,24 @@ class PassDataProcessor:
             "team_avg_goals",
             "opponent_avg_goals",
 
+            # Player-specific features
+            "player_career_avg_passes",
+            "player_career_avg_passes_per90",
+            "player_pass_consistency",
+            "player_games_played",
+            "player_career_completion_rate",
+
+            # Player form
+            "player_recent_passes_avg",
+            "player_recent_completion_rate",
+            "player_form_trend",
+
+            # Player experience level (one-hot encoded)
+            "exp_new",
+            "exp_developing",
+            "exp_experienced",
+            "exp_veteran",
+
             # Player form (rolling averages)
             "passes_attempted_rolling_5",
             "passes_completed_rolling_5",
@@ -225,11 +369,12 @@ class PassDataProcessor:
 
         return df[available_features], available_features
 
-    def process_data(self, raw_df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame, List[str]]:
+    def process_data(self, raw_df: pd.DataFrame, train_mask: Optional[pd.Series] = None) -> Tuple[pd.DataFrame, pd.DataFrame, List[str]]:
         """Full processing pipeline.
 
         Args:
             raw_df: Raw data from StatsBomb
+            train_mask: Boolean mask for training data (to avoid leakage in player stats)
 
         Returns:
             Tuple of (processed_df, feature_matrix, feature_names)
@@ -246,8 +391,15 @@ class PassDataProcessor:
         # Calculate team strength
         df = self.calculate_team_strength(df)
 
+        # Calculate player-specific statistics
+        df = self.calculate_player_statistics(df, train_mask)
+        logger.info("Added player-specific features")
+
         # Add rolling features
         df = self.add_rolling_features(df)
+
+        # Add player form features
+        df = self.add_player_form_features(df)
 
         # Create model features
         feature_matrix, feature_names = self.create_model_features(df)

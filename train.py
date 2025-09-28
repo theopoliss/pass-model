@@ -6,6 +6,7 @@ import pickle
 import sys
 from pathlib import Path
 from datetime import datetime
+from typing import Optional
 
 import numpy as np
 import pandas as pd
@@ -121,11 +122,12 @@ def collect_data(competitions: list = None) -> pd.DataFrame:
         raise ValueError("No data collected")
 
 
-def prepare_features(raw_data: pd.DataFrame) -> tuple:
+def prepare_features(raw_data: pd.DataFrame, train_mask: Optional[pd.Series] = None) -> tuple:
     """Prepare features for modeling.
 
     Args:
         raw_data: Raw player-match data
+        train_mask: Boolean mask for training data (to calculate player stats without leakage)
 
     Returns:
         Tuple of (processed_data, feature_matrix, feature_names, target)
@@ -136,7 +138,7 @@ def prepare_features(raw_data: pd.DataFrame) -> tuple:
         exclude_goalkeepers=config.data.exclude_goalkeepers
     )
 
-    processed_data, feature_matrix, feature_names = processor.process_data(raw_data)
+    processed_data, feature_matrix, feature_names = processor.process_data(raw_data, train_mask)
 
     # Additional feature engineering
     engineer = FeatureEngineer()
@@ -416,9 +418,9 @@ def main(args):
         logger.info(f"Loading data from {data_path}")
         raw_data = pd.read_csv(data_path)
 
-    # Step 2: Prepare features
+    # Step 2: Prepare features (without player-specific stats initially to avoid leakage)
     logger.info("Preparing features")
-    processed_data, X, feature_names, y, exposure = prepare_features(raw_data)
+    processed_data, X, feature_names, y, exposure = prepare_features(raw_data, None)
 
     logger.info(f"Dataset shape: {X.shape}")
     logger.info(f"Features: {feature_names}")
