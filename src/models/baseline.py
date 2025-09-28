@@ -86,6 +86,7 @@ class PoissonRegression(BaseEstimator, RegressorMixin):
         self.alpha = alpha
         self.model_ = None
         self.results_ = None
+        self.feature_columns_ = None  # Track columns used in fitting
 
     def fit(self, X: pd.DataFrame, y: pd.Series, exposure: Optional[pd.Series] = None) -> "PoissonRegression":
         """Fit the Poisson regression model.
@@ -101,8 +102,22 @@ class PoissonRegression(BaseEstimator, RegressorMixin):
         # Handle missing values in features
         X_clean = X.fillna(X.mean())
 
-        # Add constant
-        X_with_const = sm.add_constant(X_clean)
+        # Store original column means for prediction
+        self.feature_means_ = X.mean()
+
+        # Add constant (force add even if one might exist)
+        X_with_const = sm.add_constant(X_clean, prepend=True, has_constant='add')
+
+        # Check for and remove any columns with zero variance to avoid singularity
+        col_variance = X_with_const.var()
+        non_zero_var_cols = col_variance > 1e-10
+        if not all(non_zero_var_cols):
+            dropped_cols = X_with_const.columns[~non_zero_var_cols].tolist()
+            print(f"Warning: Dropping zero-variance columns: {dropped_cols}")
+            X_with_const = X_with_const.loc[:, non_zero_var_cols]
+
+        # Store the columns that were actually used for fitting
+        self.feature_columns_ = X_with_const.columns.tolist()
 
         # Prepare exposure
         if self.use_exposure and exposure is not None:
@@ -111,18 +126,29 @@ class PoissonRegression(BaseEstimator, RegressorMixin):
         else:
             offset = None
 
-        # Fit Poisson model
-        self.model_ = Poisson(
-            endog=y,
-            exog=X_with_const,
-            offset=offset
-        )
+        try:
+            # Fit Poisson model
+            self.model_ = Poisson(
+                endog=y,
+                exog=X_with_const,
+                offset=offset
+            )
 
-        # Add regularization if specified
-        if self.alpha > 0:
-            self.results_ = self.model_.fit_regularized(alpha=self.alpha)
-        else:
-            self.results_ = self.model_.fit(disp=False)
+            # Add regularization if specified
+            if self.alpha > 0:
+                self.results_ = self.model_.fit_regularized(alpha=self.alpha)
+            else:
+                self.results_ = self.model_.fit(disp=False)
+
+        except np.linalg.LinAlgError as e:
+            # If standard fit fails, use regularization to handle singularity
+            print(f"Warning: Standard Poisson regression failed ({e}), using regularization")
+            self.model_ = Poisson(
+                endog=y,
+                exog=X_with_const,
+                offset=offset
+            )
+            self.results_ = self.model_.fit_regularized(alpha=0.01, disp=False)
 
         return self
 
@@ -139,11 +165,26 @@ class PoissonRegression(BaseEstimator, RegressorMixin):
         if self.results_ is None:
             raise ValueError("Model must be fitted before prediction")
 
-        # Handle missing values first
-        X_clean = X.fillna(X.mean())
+        # Handle missing values first - use stored means from training
+        if hasattr(self, 'feature_means_'):
+            X_clean = X.fillna(self.feature_means_)
+        else:
+            X_clean = X.fillna(X.mean())
 
         # Add constant - must match training exactly
-        X_with_const = sm.add_constant(X_clean, has_constant='add')
+        X_with_const = sm.add_constant(X_clean, prepend=True, has_constant='add')
+
+        # Ensure we only use the columns that were used during fitting
+        if self.feature_columns_ is not None:
+            # Only keep columns that were used during training
+            cols_to_use = [col for col in self.feature_columns_ if col in X_with_const.columns]
+            if len(cols_to_use) < len(self.feature_columns_):
+                # Some columns from training are missing, add them as zeros
+                for col in self.feature_columns_:
+                    if col not in X_with_const.columns:
+                        X_with_const[col] = 0
+            # Reorder columns to match training
+            X_with_const = X_with_const[self.feature_columns_]
 
         # Prepare exposure
         if self.use_exposure and exposure is not None:

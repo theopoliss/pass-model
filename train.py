@@ -28,7 +28,8 @@ from src.models.baseline import (
 from src.models.advanced_models import (
     PositionSpecificModel,
     XGBoostRegressor,
-    TwoStageModel
+    WeightedEnsemble,
+    StackingEnsemble
 )
 from src.evaluation.metrics import PassPredictionEvaluator
 
@@ -153,7 +154,87 @@ def prepare_features(raw_data: pd.DataFrame) -> tuple:
     return processed_data, feature_matrix, feature_names, target, exposure
 
 
-def train_models(X_train, y_train, X_test, y_test, exposure_train=None, exposure_test=None) -> dict:
+def tune_xgboost_hyperparameters(X_train, y_train, exposure_train=None, n_iter=20):
+    """Tune XGBoost hyperparameters with proper exposure handling.
+
+    Args:
+        X_train: Training features
+        y_train: Training targets
+        exposure_train: Exposure values for training
+        n_iter: Number of parameter settings sampled
+
+    Returns:
+        Best parameters found
+    """
+    logger.info("Starting XGBoost hyperparameter tuning...")
+
+    # Define parameter distributions
+    param_distributions = {
+        'max_depth': [3, 5, 7, 10],
+        'learning_rate': [0.01, 0.05, 0.1, 0.2],
+        'n_estimators': [100, 200, 300],
+        'subsample': [0.6, 0.8, 1.0],
+        'colsample_bytree': [0.6, 0.8, 1.0],
+        'min_child_weight': [1, 3, 5],
+        'gamma': [0, 0.1, 0.2],
+        'reg_alpha': [0, 0.01, 0.1],
+        'reg_lambda': [1, 1.5, 2]
+    }
+
+    # Manual randomized search with proper exposure handling
+    from sklearn.model_selection import KFold
+    from sklearn.metrics import mean_absolute_error
+    import random
+
+    best_score = float('inf')
+    best_params = None
+
+    # Random sampling of parameter combinations
+    random.seed(42)
+    for i in range(n_iter):
+        # Sample parameters
+        params = {
+            key: random.choice(values) for key, values in param_distributions.items()
+        }
+
+        # Cross-validation with exposure
+        kf = KFold(n_splits=3, shuffle=True, random_state=42)
+        cv_scores = []
+
+        for train_idx, val_idx in kf.split(X_train):
+            X_cv_train, X_cv_val = X_train.iloc[train_idx], X_train.iloc[val_idx]
+            y_cv_train, y_cv_val = y_train.iloc[train_idx], y_train.iloc[val_idx]
+
+            if exposure_train is not None:
+                exp_cv_train = exposure_train.iloc[train_idx]
+                exp_cv_val = exposure_train.iloc[val_idx]
+            else:
+                exp_cv_train = exp_cv_val = None
+
+            # Train model with current params
+            model = XGBoostRegressor(
+                use_exposure=config.model.use_exposure,
+                base_params={'objective': 'count:poisson', 'seed': 42, **params}
+            )
+            model.fit(X_cv_train, y_cv_train, exposure=exp_cv_train)
+
+            # Predict and score
+            y_pred = model.predict(X_cv_val, exposure=exp_cv_val)
+            cv_scores.append(mean_absolute_error(y_cv_val, y_pred))
+
+        # Average CV score
+        avg_score = np.mean(cv_scores)
+        if avg_score < best_score:
+            best_score = avg_score
+            best_params = params
+            logger.info(f"  New best params (iter {i+1}): MAE={avg_score:.3f}")
+
+    logger.info(f"Best parameters found: {best_params}")
+    logger.info(f"Best CV score (MAE): {best_score:.3f}")
+
+    return best_params
+
+def train_models(X_train, y_train, X_test, y_test, exposure_train=None, exposure_test=None, tune_xgb=False, ensemble_type='weighted') -> dict:
     """Train multiple models and evaluate them.
 
     Args:
@@ -207,39 +288,70 @@ def train_models(X_train, y_train, X_test, y_test, exposure_train=None, exposure
 
     # 5. XGBoost
     logger.info("Training XGBoost Model")
-    xgb_model = XGBoostRegressor(use_exposure=config.model.use_exposure)
+
+    # Tune hyperparameters if requested
+    if tune_xgb:
+        best_params = tune_xgboost_hyperparameters(X_train, y_train, exposure_train)
+        # Merge with base params
+        xgb_params = {
+            'objective': 'count:poisson',
+            'seed': 42,
+            **best_params
+        }
+        xgb_model = XGBoostRegressor(use_exposure=config.model.use_exposure, base_params=xgb_params)
+    else:
+        xgb_model = XGBoostRegressor(use_exposure=config.model.use_exposure)
+
     xgb_model.fit(X_train, y_train, exposure=exposure_train)
     y_pred_xgb = xgb_model.predict(X_test, exposure=exposure_test)
     results["xgboost"] = evaluator.evaluate(y_test, y_pred_xgb)
     models["xgboost"] = xgb_model
 
-    # 6. Two-Stage Model
-    logger.info("Training Two-Stage Model")
-    two_stage_model = TwoStageModel(
-        team_model_class=XGBoostRegressor,
-        player_model_class=PoissonRegression
-    )
-    two_stage_model.fit(X_train, y_train, exposure=exposure_train)
-    y_pred_two_stage = two_stage_model.predict(X_test, exposure=exposure_test)
-    results["two_stage"] = evaluator.evaluate(y_test, y_pred_two_stage)
-    models["two_stage"] = two_stage_model
+    # 6. Ensemble (using already-trained models)
+    logger.info(f"Training {ensemble_type.capitalize()} Ensemble Model")
 
-    # 7. Ensemble (updated with better models)
-    logger.info("Training Advanced Ensemble Model")
-    ensemble_models = {
-        "poisson": PoissonRegression(use_exposure=config.model.use_exposure),
-        "position_specific": PositionSpecificModel(
-            base_model_class=PoissonRegression,
-            position_column="position_encoded",
-            model_params={"use_exposure": config.model.use_exposure}
-        ),
-        "xgboost": XGBoostRegressor(use_exposure=config.model.use_exposure)
+    # Use the already-trained models for ensemble
+    ensemble_base_models = {
+        "poisson": models["poisson"],
+        "position_specific": models["position_specific"],
+        "xgboost": models["xgboost"]
     }
-    ensemble_model = EnsembleBaseline(models=ensemble_models)
-    ensemble_model.fit(X_train, y_train, exposure=exposure_train)
-    y_pred_ensemble = ensemble_model.predict(X_test, exposure=exposure_test)
-    results["ensemble_advanced"] = evaluator.evaluate(y_test, y_pred_ensemble)
-    models["ensemble_advanced"] = ensemble_model
+
+    if ensemble_type == 'stacking':
+        # Stacking ensemble with meta-learner
+        ensemble_model = StackingEnsemble(
+            base_models=ensemble_base_models,
+            use_cv=True
+        )
+        ensemble_model.fit(X_train, y_train, exposure=exposure_train)
+        y_pred_ensemble = ensemble_model.predict(X_test, exposure=exposure_test)
+        results["ensemble_stacking"] = evaluator.evaluate(y_test, y_pred_ensemble)
+        models["ensemble_stacking"] = ensemble_model
+
+    elif ensemble_type == 'weighted':
+        # Weighted ensemble based on validation performance
+        ensemble_model = WeightedEnsemble(
+            models=ensemble_base_models,
+            weight_method='inverse_mae'
+        )
+        ensemble_model.fit(X_train, y_train, exposure=exposure_train)
+        y_pred_ensemble = ensemble_model.predict(X_test, exposure=exposure_test)
+
+        # Log the weights
+        if hasattr(ensemble_model, 'weights_'):
+            logger.info(f"Ensemble weights: {ensemble_model.weights_}")
+            logger.info(f"Validation scores: {ensemble_model.validation_scores_}")
+
+        results["ensemble_weighted"] = evaluator.evaluate(y_test, y_pred_ensemble)
+        models["ensemble_weighted"] = ensemble_model
+
+    else:
+        # Simple averaging ensemble (fallback)
+        ensemble_model = EnsembleBaseline(models=ensemble_base_models)
+        ensemble_model.fit(X_train, y_train, exposure=exposure_train)
+        y_pred_ensemble = ensemble_model.predict(X_test, exposure=exposure_test)
+        results["ensemble_simple"] = evaluator.evaluate(y_test, y_pred_ensemble)
+        models["ensemble_simple"] = ensemble_model
 
     return models, results
 
@@ -328,7 +440,9 @@ def main(args):
     logger.info("Training models")
     models, results = train_models(
         X_train, y_train, X_test, y_test,
-        exposure_train, exposure_test
+        exposure_train, exposure_test,
+        tune_xgb=args.tune,
+        ensemble_type=args.ensemble
     )
 
     # Step 5: Save models and results
@@ -361,6 +475,9 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Train pass prediction models")
     parser.add_argument("--collect-data", action="store_true", help="Collect fresh data from StatsBomb")
     parser.add_argument("--plot", action="store_true", help="Generate evaluation plots")
+    parser.add_argument("--tune", action="store_true", help="Tune XGBoost hyperparameters")
+    parser.add_argument("--ensemble", type=str, default="weighted", choices=["simple", "weighted", "stacking"],
+                       help="Type of ensemble to use (default: weighted)")
     parser.add_argument("--config", type=str, help="Path to config file")
     parser.add_argument("--competitions", type=str, help="Comma-separated list of competition_id:season_id pairs (e.g., '43:3,55:43')")
     parser.add_argument("--list-competitions", action="store_true", help="List available competitions and exit")

@@ -45,9 +45,16 @@ class PositionSpecificModel(BaseEstimator, RegressorMixin):
         """
         # Train global model as fallback
         self.global_model_ = self.base_model_class(**self.model_params)
-        if hasattr(self.global_model_, 'fit') and 'exposure' in self.global_model_.fit.__code__.co_varnames:
-            self.global_model_.fit(X, y, exposure=exposure)
-        else:
+        try:
+            if hasattr(self.global_model_, 'fit') and 'exposure' in self.global_model_.fit.__code__.co_varnames:
+                self.global_model_.fit(X, y, exposure=exposure)
+            else:
+                self.global_model_.fit(X, y)
+        except (np.linalg.LinAlgError, ValueError) as e:
+            # If global model fails, use a simple historical average
+            print(f"Warning: Global model failed to fit ({e}), using historical average")
+            from ..models.baseline import HistoricalAverageBaseline
+            self.global_model_ = HistoricalAverageBaseline()
             self.global_model_.fit(X, y)
 
         # Get unique positions
@@ -61,18 +68,24 @@ class PositionSpecificModel(BaseEstimator, RegressorMixin):
                 y_pos = y[position_mask]
 
                 if len(X_pos) >= 50:  # Only train if sufficient data
-                    model = self.base_model_class(**self.model_params)
+                    try:
+                        model = self.base_model_class(**self.model_params)
 
-                    if exposure is not None:
-                        exposure_pos = exposure[position_mask]
-                        if hasattr(model, 'fit') and 'exposure' in model.fit.__code__.co_varnames:
-                            model.fit(X_pos, y_pos, exposure=exposure_pos)
+                        if exposure is not None:
+                            exposure_pos = exposure[position_mask]
+                            if hasattr(model, 'fit') and 'exposure' in model.fit.__code__.co_varnames:
+                                model.fit(X_pos, y_pos, exposure=exposure_pos)
+                            else:
+                                model.fit(X_pos, y_pos)
                         else:
                             model.fit(X_pos, y_pos)
-                    else:
-                        model.fit(X_pos, y_pos)
 
-                    self.models_[position] = model
+                        self.models_[position] = model
+
+                    except (np.linalg.LinAlgError, ValueError) as e:
+                        # Skip this position model if it fails
+                        print(f"Warning: Position {position} model failed to fit ({e}), will use global model")
+                        continue
 
         return self
 
@@ -89,16 +102,17 @@ class PositionSpecificModel(BaseEstimator, RegressorMixin):
         predictions = np.zeros(len(X))
 
         if self.position_column in X.columns:
-            for idx, row in X.iterrows():
+            # Use enumerate to get positional indices
+            for i, (idx, row) in enumerate(X.iterrows()):
                 position = row[self.position_column]
 
                 # Use position-specific model if available
                 if position in self.models_:
                     model = self.models_[position]
-                    X_row = X.iloc[[idx]]
+                    X_row = X.loc[[idx]]  # Use .loc with actual index
 
                     if exposure is not None:
-                        exposure_row = exposure.iloc[[idx]] if isinstance(exposure, pd.Series) else exposure[[idx]]
+                        exposure_row = exposure.loc[[idx]] if isinstance(exposure, pd.Series) else exposure[[i]]
                         if hasattr(model, 'predict') and 'exposure' in model.predict.__code__.co_varnames:
                             pred = model.predict(X_row, exposure=exposure_row)
                         else:
@@ -106,12 +120,12 @@ class PositionSpecificModel(BaseEstimator, RegressorMixin):
                     else:
                         pred = model.predict(X_row)
 
-                    predictions[idx] = pred[0]
+                    predictions[i] = pred[0]  # Use positional index for storing
                 else:
                     # Use global model as fallback
-                    X_row = X.iloc[[idx]]
+                    X_row = X.loc[[idx]]  # Use .loc with actual index
                     if exposure is not None:
-                        exposure_row = exposure.iloc[[idx]] if isinstance(exposure, pd.Series) else exposure[[idx]]
+                        exposure_row = exposure.loc[[idx]] if isinstance(exposure, pd.Series) else exposure[[i]]
                         if hasattr(self.global_model_, 'predict') and 'exposure' in self.global_model_.predict.__code__.co_varnames:
                             pred = self.global_model_.predict(X_row, exposure=exposure_row)
                         else:
@@ -119,7 +133,7 @@ class PositionSpecificModel(BaseEstimator, RegressorMixin):
                     else:
                         pred = self.global_model_.predict(X_row)
 
-                    predictions[idx] = pred[0]
+                    predictions[i] = pred[0]  # Use positional index for storing
         else:
             # No position column, use global model
             if exposure is not None:
@@ -136,15 +150,37 @@ class PositionSpecificModel(BaseEstimator, RegressorMixin):
 class XGBoostRegressor(BaseEstimator, RegressorMixin):
     """XGBoost model for pass prediction."""
 
-    def __init__(self, use_exposure: bool = True, **xgb_params):
+    def __init__(self, use_exposure: bool = True, base_params: Optional[Dict] = None,
+                 max_depth: int = 5, learning_rate: float = 0.1, n_estimators: int = 100,
+                 subsample: float = 0.8, colsample_bytree: float = 0.8,
+                 min_child_weight: float = 1, gamma: float = 0,
+                 reg_alpha: float = 0, reg_lambda: float = 1):
         """Initialize XGBoost regressor.
 
         Args:
             use_exposure: Whether to use exposure (minutes played)
-            **xgb_params: Parameters for XGBoost
+            base_params: Base parameters dict (overrides individual params)
+            max_depth: Maximum depth of trees
+            learning_rate: Learning rate
+            n_estimators: Number of trees
+            subsample: Subsample ratio
+            colsample_bytree: Column subsample ratio
+            min_child_weight: Minimum child weight
+            gamma: Gamma regularization
+            reg_alpha: L1 regularization
+            reg_lambda: L2 regularization
         """
         self.use_exposure = use_exposure
-        self.xgb_params = xgb_params
+        self.base_params = base_params
+        self.max_depth = max_depth
+        self.learning_rate = learning_rate
+        self.n_estimators = n_estimators
+        self.subsample = subsample
+        self.colsample_bytree = colsample_bytree
+        self.min_child_weight = min_child_weight
+        self.gamma = gamma
+        self.reg_alpha = reg_alpha
+        self.reg_lambda = reg_lambda
         self.model_ = None
         self.feature_names_ = None
 
@@ -163,20 +199,26 @@ class XGBoostRegressor(BaseEstimator, RegressorMixin):
         X_clean = X.fillna(X.mean())
         self.feature_names_ = X_clean.columns.tolist()
 
-        # Default XGBoost parameters for count regression
-        default_params = {
-            'objective': 'count:poisson',  # Poisson regression for counts
-            'n_estimators': 100,
-            'max_depth': 5,
-            'learning_rate': 0.1,
-            'subsample': 0.8,
-            'colsample_bytree': 0.8,
-            'random_state': 42,
-            'verbosity': 0
-        }
-
-        # Update with user parameters
-        params = {**default_params, **self.xgb_params}
+        # Build parameters from instance attributes
+        if self.base_params:
+            # Use base_params if provided (for tuned parameters)
+            params = self.base_params.copy()
+        else:
+            # Build from individual parameters
+            params = {
+                'objective': 'count:poisson',  # Poisson regression for counts
+                'n_estimators': self.n_estimators,
+                'max_depth': self.max_depth,
+                'learning_rate': self.learning_rate,
+                'subsample': self.subsample,
+                'colsample_bytree': self.colsample_bytree,
+                'min_child_weight': self.min_child_weight,
+                'gamma': self.gamma,
+                'reg_alpha': self.reg_alpha,
+                'reg_lambda': self.reg_lambda,
+                'random_state': 42,
+                'verbosity': 0
+            }
 
         # Create DMatrix with exposure if provided
         if self.use_exposure and exposure is not None:
@@ -384,5 +426,257 @@ class TwoStageModel(BaseEstimator, RegressorMixin):
         else:
             # Default to team volume divided by 11 players
             predictions = team_volumes / 11
+
+        return predictions
+
+
+class StackingEnsemble(BaseEstimator, RegressorMixin):
+    """Stacking ensemble with meta-learner for optimal model combination."""
+
+    def __init__(self, base_models: Dict[str, BaseEstimator] = None,
+                 meta_learner=None, use_cv: bool = True):
+        """Initialize stacking ensemble.
+
+        Args:
+            base_models: Dictionary of base models
+            meta_learner: Meta-learner model (default: Ridge)
+            use_cv: Use cross-validation for generating meta features
+        """
+        self.base_models = base_models or {}
+        self.meta_learner = meta_learner
+        self.use_cv = use_cv
+        self.meta_features_train_ = None
+        self.fitted_models_ = {}
+
+    def fit(self, X: pd.DataFrame, y: pd.Series, exposure: Optional[pd.Series] = None):
+        """Fit stacking ensemble.
+
+        Args:
+            X: Feature matrix
+            y: Target values
+            exposure: Exposure variable
+
+        Returns:
+            Self
+        """
+        from sklearn.model_selection import KFold
+        from sklearn.linear_model import Ridge
+
+        # Use Ridge regression as default meta-learner
+        if self.meta_learner is None:
+            self.meta_learner = Ridge(alpha=1.0)
+
+        n_samples = len(X)
+        n_models = len(self.base_models)
+
+        if self.use_cv:
+            # Generate out-of-fold predictions for meta-learner training
+            meta_features = np.zeros((n_samples, n_models))
+            kf = KFold(n_splits=3, shuffle=True, random_state=42)
+
+            for model_idx, (name, model) in enumerate(self.base_models.items()):
+                oof_predictions = np.zeros(n_samples)
+
+                for train_idx, val_idx in kf.split(X):
+                    X_train_cv, X_val_cv = X.iloc[train_idx], X.iloc[val_idx]
+                    y_train_cv, y_val_cv = y.iloc[train_idx], y.iloc[val_idx]
+
+                    # Clone model for CV
+                    model_clone = model.__class__(**model.get_params() if hasattr(model, 'get_params') else {})
+
+                    # Fit with exposure if needed
+                    if exposure is not None:
+                        exp_train_cv = exposure.iloc[train_idx]
+                        exp_val_cv = exposure.iloc[val_idx]
+                        if hasattr(model_clone, 'fit') and 'exposure' in model_clone.fit.__code__.co_varnames:
+                            model_clone.fit(X_train_cv, y_train_cv, exposure=exp_train_cv)
+                        else:
+                            model_clone.fit(X_train_cv, y_train_cv)
+
+                        # Predict with exposure
+                        if hasattr(model_clone, 'predict') and 'exposure' in model_clone.predict.__code__.co_varnames:
+                            oof_predictions[val_idx] = model_clone.predict(X_val_cv, exposure=exp_val_cv)
+                        else:
+                            oof_predictions[val_idx] = model_clone.predict(X_val_cv)
+                    else:
+                        model_clone.fit(X_train_cv, y_train_cv)
+                        oof_predictions[val_idx] = model_clone.predict(X_val_cv)
+
+                meta_features[:, model_idx] = oof_predictions
+
+        else:
+            # Simple train-validation split for meta features
+            from sklearn.model_selection import train_test_split
+
+            X_base, X_meta, y_base, y_meta = train_test_split(X, y, test_size=0.2, random_state=42)
+            if exposure is not None:
+                exp_base, exp_meta = train_test_split(exposure, test_size=0.2, random_state=42)
+            else:
+                exp_base = exp_meta = None
+
+            meta_features = np.zeros((len(X_meta), n_models))
+
+            for model_idx, (name, model) in enumerate(self.base_models.items()):
+                # Fit on base set
+                if exposure is not None and hasattr(model, 'fit') and 'exposure' in model.fit.__code__.co_varnames:
+                    model.fit(X_base, y_base, exposure=exp_base)
+                else:
+                    model.fit(X_base, y_base)
+
+                # Predict on meta set
+                if exposure is not None and hasattr(model, 'predict') and 'exposure' in model.predict.__code__.co_varnames:
+                    meta_features[:, model_idx] = model.predict(X_meta, exposure=exp_meta)
+                else:
+                    meta_features[:, model_idx] = model.predict(X_meta)
+
+            y = y_meta  # Use meta set targets for meta-learner
+
+        # Train meta-learner on out-of-fold predictions
+        self.meta_learner.fit(meta_features, y)
+
+        # Retrain all base models on full training data
+        for name, model in self.base_models.items():
+            if exposure is not None and hasattr(model, 'fit') and 'exposure' in model.fit.__code__.co_varnames:
+                model.fit(X, y.iloc[:len(X)] if hasattr(y, 'iloc') else y, exposure=exposure)
+            else:
+                model.fit(X, y.iloc[:len(X)] if hasattr(y, 'iloc') else y)
+            self.fitted_models_[name] = model
+
+        return self
+
+    def predict(self, X: pd.DataFrame, exposure: Optional[pd.Series] = None) -> np.ndarray:
+        """Make stacked predictions.
+
+        Args:
+            X: Feature matrix
+            exposure: Exposure variable
+
+        Returns:
+            Meta-learner predictions
+        """
+        n_samples = len(X)
+        n_models = len(self.fitted_models_)
+        meta_features = np.zeros((n_samples, n_models))
+
+        # Generate base model predictions
+        for model_idx, (name, model) in enumerate(self.fitted_models_.items()):
+            if exposure is not None and hasattr(model, 'predict') and 'exposure' in model.predict.__code__.co_varnames:
+                meta_features[:, model_idx] = model.predict(X, exposure=exposure)
+            else:
+                meta_features[:, model_idx] = model.predict(X)
+
+        # Use meta-learner to combine predictions
+        predictions = self.meta_learner.predict(meta_features)
+
+        # Ensure non-negative predictions for count data
+        predictions = np.maximum(predictions, 0)
+
+        return predictions
+
+
+class WeightedEnsemble(BaseEstimator, RegressorMixin):
+    """Weighted ensemble based on validation performance."""
+
+    def __init__(self, models: Dict[str, BaseEstimator] = None,
+                 weight_method: str = 'inverse_mae'):
+        """Initialize weighted ensemble.
+
+        Args:
+            models: Dictionary of models
+            weight_method: Method for calculating weights ('inverse_mae', 'softmax')
+        """
+        self.models = models or {}
+        self.weight_method = weight_method
+        self.weights_ = None
+        self.validation_scores_ = None
+
+    def fit(self, X: pd.DataFrame, y: pd.Series, exposure: Optional[pd.Series] = None):
+        """Fit models and calculate weights.
+
+        Args:
+            X: Feature matrix
+            y: Target values
+            exposure: Exposure variable
+
+        Returns:
+            Self
+        """
+        from sklearn.model_selection import train_test_split
+        from sklearn.metrics import mean_absolute_error
+
+        # Split data for weight calculation
+        X_train, X_val, y_train, y_val = train_test_split(X, y, test_size=0.2, random_state=42)
+        if exposure is not None:
+            exp_train, exp_val = train_test_split(exposure, test_size=0.2, random_state=42)
+        else:
+            exp_train = exp_val = None
+
+        self.validation_scores_ = {}
+
+        # Train models and evaluate on validation set
+        for name, model in self.models.items():
+            # Train on training split
+            if exposure is not None and hasattr(model, 'fit') and 'exposure' in model.fit.__code__.co_varnames:
+                model.fit(X_train, y_train, exposure=exp_train)
+            else:
+                model.fit(X_train, y_train)
+
+            # Predict on validation split
+            if exposure is not None and hasattr(model, 'predict') and 'exposure' in model.predict.__code__.co_varnames:
+                y_pred = model.predict(X_val, exposure=exp_val)
+            else:
+                y_pred = model.predict(X_val)
+
+            # Calculate validation MAE
+            self.validation_scores_[name] = mean_absolute_error(y_val, y_pred)
+
+        # Calculate weights based on validation performance
+        if self.weight_method == 'inverse_mae':
+            # Inverse MAE weighting
+            inverse_scores = {name: 1.0 / score for name, score in self.validation_scores_.items()}
+            total = sum(inverse_scores.values())
+            self.weights_ = {name: score / total for name, score in inverse_scores.items()}
+
+        elif self.weight_method == 'softmax':
+            # Softmax on negative MAE
+            import math
+            neg_scores = {name: -score for name, score in self.validation_scores_.items()}
+            exp_scores = {name: math.exp(score) for name, score in neg_scores.items()}
+            total = sum(exp_scores.values())
+            self.weights_ = {name: score / total for name, score in exp_scores.items()}
+
+        else:
+            # Equal weights fallback
+            self.weights_ = {name: 1.0 / len(self.models) for name in self.models}
+
+        # Retrain models on full dataset
+        for name, model in self.models.items():
+            if exposure is not None and hasattr(model, 'fit') and 'exposure' in model.fit.__code__.co_varnames:
+                model.fit(X, y, exposure=exposure)
+            else:
+                model.fit(X, y)
+
+        return self
+
+    def predict(self, X: pd.DataFrame, exposure: Optional[pd.Series] = None) -> np.ndarray:
+        """Make weighted predictions.
+
+        Args:
+            X: Feature matrix
+            exposure: Exposure variable
+
+        Returns:
+            Weighted predictions
+        """
+        predictions = np.zeros(len(X))
+
+        for name, model in self.models.items():
+            if hasattr(model, 'predict'):
+                if exposure is not None and 'exposure' in model.predict.__code__.co_varnames:
+                    pred = model.predict(X, exposure=exposure)
+                else:
+                    pred = model.predict(X)
+
+                predictions += self.weights_[name] * pred
 
         return predictions
