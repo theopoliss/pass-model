@@ -2,7 +2,7 @@
 
 import numpy as np
 import pandas as pd
-from typing import List, Tuple, Optional
+from typing import List, Tuple, Optional, Dict
 from sklearn.preprocessing import StandardScaler
 
 
@@ -355,5 +355,182 @@ class FeatureEngineer:
 
         # Handle missing values
         df = self.handle_missing_values(df)
+
+        return df
+
+
+class TacticalFeatureEngineer:
+    """Engineer tactical and formation-based features."""
+
+    def __init__(self):
+        """Initialize tactical feature engineer."""
+        self.formation_mapping = {
+            '433': {'defenders': 4, 'midfielders': 3, 'forwards': 3, 'width': 'wide', 'style': 'possession'},
+            '442': {'defenders': 4, 'midfielders': 4, 'forwards': 2, 'width': 'balanced', 'style': 'balanced'},
+            '352': {'defenders': 3, 'midfielders': 5, 'forwards': 2, 'width': 'wide', 'style': 'defensive'},
+            '4231': {'defenders': 4, 'midfielders': 5, 'forwards': 1, 'width': 'narrow', 'style': 'possession'},
+            '343': {'defenders': 3, 'midfielders': 4, 'forwards': 3, 'width': 'wide', 'style': 'attacking'},
+            '451': {'defenders': 4, 'midfielders': 5, 'forwards': 1, 'width': 'narrow', 'style': 'defensive'},
+            '4141': {'defenders': 4, 'midfielders': 5, 'forwards': 1, 'width': 'narrow', 'style': 'defensive'},
+            '532': {'defenders': 5, 'midfielders': 3, 'forwards': 2, 'width': 'narrow', 'style': 'defensive'},
+        }
+
+    def extract_formation_numbers(self, formation: str) -> Dict[str, int]:
+        """Extract numerical composition from formation string.
+
+        Args:
+            formation: Formation string (e.g., '433', '4231')
+
+        Returns:
+            Dictionary with defender, midfielder, forward counts
+        """
+        if pd.isna(formation) or formation not in self.formation_mapping:
+            # Default to 442 if unknown
+            return {'defenders': 4, 'midfielders': 4, 'forwards': 2}
+
+        return self.formation_mapping[formation]
+
+    def create_formation_features(self, df: pd.DataFrame) -> pd.DataFrame:
+        """Create basic formation features.
+
+        Args:
+            df: DataFrame with team_formation and opponent_formation columns
+
+        Returns:
+            DataFrame with formation features added
+        """
+        df = df.copy()
+
+        # One-hot encode formations
+        if 'team_formation' in df.columns:
+            # Basic encoding
+            team_formation_dummies = pd.get_dummies(df['team_formation'], prefix='team_formation')
+            df = pd.concat([df, team_formation_dummies], axis=1)
+
+            # Extract numerical composition
+            team_numbers = df['team_formation'].apply(self.extract_formation_numbers)
+            df['team_defenders'] = team_numbers.apply(lambda x: x['defenders'])
+            df['team_midfielders'] = team_numbers.apply(lambda x: x['midfielders'])
+            df['team_forwards'] = team_numbers.apply(lambda x: x['forwards'])
+
+        if 'opponent_formation' in df.columns:
+            # Basic encoding
+            opp_formation_dummies = pd.get_dummies(df['opponent_formation'], prefix='opp_formation')
+            df = pd.concat([df, opp_formation_dummies], axis=1)
+
+            # Extract numerical composition
+            opp_numbers = df['opponent_formation'].apply(self.extract_formation_numbers)
+            df['opp_defenders'] = opp_numbers.apply(lambda x: x['defenders'])
+            df['opp_midfielders'] = opp_numbers.apply(lambda x: x['midfielders'])
+            df['opp_forwards'] = opp_numbers.apply(lambda x: x['forwards'])
+
+        return df
+
+    def create_tactical_matchup_features(self, df: pd.DataFrame) -> pd.DataFrame:
+        """Create features based on tactical matchups.
+
+        Args:
+            df: DataFrame with formation features
+
+        Returns:
+            DataFrame with tactical matchup features added
+        """
+        df = df.copy()
+
+        if all(col in df.columns for col in ['team_midfielders', 'opp_midfielders']):
+            # Numerical advantages/disadvantages
+            df['midfield_advantage'] = df['team_midfielders'] - df['opp_midfielders']
+            df['defensive_advantage'] = df['team_defenders'] - df['opp_defenders']
+            df['attacking_advantage'] = df['team_forwards'] - df['opp_forwards']
+
+            # Relative balance
+            df['formation_balance_diff'] = (df['team_midfielders'] / 10) - (df['opp_midfielders'] / 10)
+
+        if all(col in df.columns for col in ['team_formation', 'opponent_formation']):
+            # Create matchup feature
+            df['formation_matchup'] = df['team_formation'].astype(str) + '_vs_' + df['opponent_formation'].astype(str)
+
+            # Width and style matchups
+            df['team_width'] = df['team_formation'].map(
+                {k: v['width'] for k, v in self.formation_mapping.items()}
+            )
+            df['opp_width'] = df['opponent_formation'].map(
+                {k: v['width'] for k, v in self.formation_mapping.items()}
+            )
+            df['team_style'] = df['team_formation'].map(
+                {k: v['style'] for k, v in self.formation_mapping.items()}
+            )
+            df['opp_style'] = df['opponent_formation'].map(
+                {k: v['style'] for k, v in self.formation_mapping.items()}
+            )
+
+            # Style clash features
+            df['width_mismatch'] = (df['team_width'] == 'wide') & (df['opp_width'] == 'narrow')
+            df['style_clash'] = df['team_style'] + '_vs_' + df['opp_style']
+
+        return df
+
+    def create_position_tactical_features(self, df: pd.DataFrame) -> pd.DataFrame:
+        """Create position-specific tactical features.
+
+        Args:
+            df: DataFrame with position and formation features
+
+        Returns:
+            DataFrame with position-tactical interaction features
+        """
+        df = df.copy()
+
+        if 'position_group' in df.columns and 'midfield_advantage' in df.columns:
+            # Position-specific impact of tactical advantages
+            df['position_tactical_impact'] = 0
+
+            # Midfielders benefit most from midfield advantage
+            mid_mask = df['position_group'] == 'MID'
+            df.loc[mid_mask, 'position_tactical_impact'] = df.loc[mid_mask, 'midfield_advantage'] * 2
+
+            # Defenders affected by defensive advantage
+            def_mask = df['position_group'] == 'DEF'
+            df.loc[def_mask, 'position_tactical_impact'] = df.loc[def_mask, 'defensive_advantage'] * 1.5
+
+            # Forwards affected by attacking setup
+            fwd_mask = df['position_group'] == 'FWD'
+            df.loc[fwd_mask, 'position_tactical_impact'] = df.loc[fwd_mask, 'attacking_advantage'] * 1
+
+        # Tactical responsibility based on formation
+        if all(col in df.columns for col in ['position_group', 'team_formation']):
+            df['tactical_workload'] = 1.0  # Default
+
+            # Higher workload for specific position-formation combinations
+            # 433 wide midfielders have more work
+            mask_433_mid = (df['team_formation'] == '433') & (df['position_group'] == 'MID')
+            df.loc[mask_433_mid, 'tactical_workload'] = 1.3
+
+            # 352 wing-backs have more work
+            mask_352_def = (df['team_formation'] == '352') & (df['position_group'] == 'DEF')
+            df.loc[mask_352_def, 'tactical_workload'] = 1.4
+
+            # Lone striker in 451/4231
+            mask_lone_striker = (df['team_formation'].isin(['451', '4231'])) & (df['position_group'] == 'FWD')
+            df.loc[mask_lone_striker, 'tactical_workload'] = 0.8
+
+        return df
+
+    def engineer_tactical_features(self, df: pd.DataFrame) -> pd.DataFrame:
+        """Main tactical feature engineering pipeline.
+
+        Args:
+            df: DataFrame with formation columns
+
+        Returns:
+            DataFrame with all tactical features added
+        """
+        df = df.copy()
+
+        # Only process if formation data exists
+        if 'team_formation' in df.columns or 'opponent_formation' in df.columns:
+            df = self.create_formation_features(df)
+            df = self.create_tactical_matchup_features(df)
+            df = self.create_position_tactical_features(df)
 
         return df

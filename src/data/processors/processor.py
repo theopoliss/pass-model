@@ -308,7 +308,7 @@ class PassDataProcessor:
 
         return df
 
-    def create_model_features(self, df: pd.DataFrame) -> Tuple[pd.DataFrame, List[str]]:
+    def create_model_features(self, df: pd.DataFrame, use_formation_features: bool = False) -> Tuple[pd.DataFrame, List[str]]:
         """Create final features for modeling.
 
         Args:
@@ -359,6 +359,35 @@ class PassDataProcessor:
             "avg_pass_length"
         ]
 
+        # Add formation features if requested
+        if use_formation_features:
+            formation_features = [
+                # Numerical advantages
+                "midfield_advantage",
+                "defensive_advantage",
+                "attacking_advantage",
+
+                # Position-tactical interaction
+                "position_tactical_impact",
+                "tactical_workload",
+
+                # Team composition
+                "team_midfielders",
+                "team_defenders",
+                "team_forwards",
+                "opp_midfielders",
+                "opp_defenders",
+                "opp_forwards",
+            ]
+
+            # Add formation-specific one-hot columns (dynamically find them)
+            formation_encoded_cols = [col for col in df.columns if
+                                     col.startswith('team_formation_') or
+                                     col.startswith('opp_formation_')]
+
+            feature_columns.extend(formation_features)
+            feature_columns.extend(formation_encoded_cols)
+
         # Keep only available features
         available_features = [col for col in feature_columns if col in df.columns]
 
@@ -369,12 +398,14 @@ class PassDataProcessor:
 
         return df[available_features], available_features
 
-    def process_data(self, raw_df: pd.DataFrame, train_mask: Optional[pd.Series] = None) -> Tuple[pd.DataFrame, pd.DataFrame, List[str]]:
+    def process_data(self, raw_df: pd.DataFrame, train_mask: Optional[pd.Series] = None,
+                    use_formation_features: bool = False) -> Tuple[pd.DataFrame, pd.DataFrame, List[str]]:
         """Full processing pipeline.
 
         Args:
             raw_df: Raw data from StatsBomb
             train_mask: Boolean mask for training data (to avoid leakage in player stats)
+            use_formation_features: Whether to include formation/tactical features
 
         Returns:
             Tuple of (processed_df, feature_matrix, feature_names)
@@ -401,8 +432,15 @@ class PassDataProcessor:
         # Add player form features
         df = self.add_player_form_features(df)
 
+        # Add formation features if requested
+        if use_formation_features and ('team_formation' in df.columns or 'opponent_formation' in df.columns):
+            from src.features.feature_engineering import TacticalFeatureEngineer
+            tactical_engineer = TacticalFeatureEngineer()
+            df = tactical_engineer.engineer_tactical_features(df)
+            logger.info("Added tactical formation features")
+
         # Create model features
-        feature_matrix, feature_names = self.create_model_features(df)
+        feature_matrix, feature_names = self.create_model_features(df, use_formation_features)
 
         logger.info(f"Created {len(feature_names)} features for {len(df)} observations")
 

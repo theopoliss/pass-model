@@ -288,6 +288,35 @@ class StatsBombCollector:
         else:
             return 'sideways'
 
+    def extract_formations(self, events_df: pd.DataFrame) -> Dict[str, Dict]:
+        """Extract formation data from Starting XI events.
+
+        Args:
+            events_df: DataFrame with match events
+
+        Returns:
+            Dictionary with match_id -> {team -> formation} mapping
+        """
+        formations = {}
+
+        # Get Starting XI events which contain tactics/formation info
+        starting_xi_events = events_df[events_df["type"] == "Starting XI"].copy()
+
+        for _, event in starting_xi_events.iterrows():
+            match_id = event["match_id"]
+            team = event["team"]
+
+            if match_id not in formations:
+                formations[match_id] = {}
+
+            # Extract formation from tactics if available
+            if pd.notna(event.get("tactics")) and isinstance(event["tactics"], dict):
+                formation = event["tactics"].get("formation")
+                if formation:
+                    formations[match_id][team] = str(formation)
+
+        return formations
+
     def aggregate_player_passes(
         self, events_df: pd.DataFrame, matches_df: pd.DataFrame, lineups: Dict
     ) -> pd.DataFrame:
@@ -301,6 +330,9 @@ class StatsBombCollector:
         Returns:
             DataFrame with player-match level pass statistics
         """
+        # Extract formations first
+        formations = self.extract_formations(events_df)
+
         # Filter for pass events
         passes = events_df[events_df["type"] == "Pass"].copy()
 
@@ -410,6 +442,22 @@ class StatsBombCollector:
             lambda x: x["away_score"] if x["is_home"] else x["home_score"], axis=1
         )
         player_passes["goal_difference"] = player_passes["team_goals"] - player_passes["opponent_goals"]
+
+        # Add formation data
+        for idx, row in player_passes.iterrows():
+            match_id = row["match_id"]
+            team = row["team"]
+            opponent_team = row["away_team"] if row["is_home"] else row["home_team"]
+
+            # Get formations for this match
+            if match_id in formations:
+                match_formations = formations[match_id]
+
+                # Team formation
+                player_passes.at[idx, "team_formation"] = match_formations.get(team, None)
+
+                # Opponent formation
+                player_passes.at[idx, "opponent_formation"] = match_formations.get(opponent_team, None)
 
         return player_passes
 

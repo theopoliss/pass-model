@@ -122,12 +122,14 @@ def collect_data(competitions: list = None) -> pd.DataFrame:
         raise ValueError("No data collected")
 
 
-def prepare_features(raw_data: pd.DataFrame, train_mask: Optional[pd.Series] = None) -> tuple:
+def prepare_features(raw_data: pd.DataFrame, train_mask: Optional[pd.Series] = None,
+                    use_formation_features: bool = False) -> tuple:
     """Prepare features for modeling.
 
     Args:
         raw_data: Raw player-match data
         train_mask: Boolean mask for training data (to calculate player stats without leakage)
+        use_formation_features: Whether to include formation features
 
     Returns:
         Tuple of (processed_data, feature_matrix, feature_names, target)
@@ -138,14 +140,15 @@ def prepare_features(raw_data: pd.DataFrame, train_mask: Optional[pd.Series] = N
         exclude_goalkeepers=config.data.exclude_goalkeepers
     )
 
-    processed_data, feature_matrix, feature_names = processor.process_data(raw_data, train_mask)
+    processed_data, feature_matrix, feature_names = processor.process_data(
+        raw_data, train_mask, use_formation_features)
 
     # Additional feature engineering
     engineer = FeatureEngineer()
     processed_data = engineer.engineer_features(processed_data, feature_set="intermediate")
 
     # Update feature matrix with new features
-    feature_matrix, feature_names = processor.create_model_features(processed_data)
+    feature_matrix, feature_names = processor.create_model_features(processed_data, use_formation_features)
 
     # Extract target
     target = processed_data[config.model.target]
@@ -390,6 +393,116 @@ def save_models(models: dict, results: dict, output_dir: Path = None):
     print(results_df[["mae", "rmse", "r2"]].round(3))
 
 
+def run_ablation_study(raw_data: pd.DataFrame, args):
+    """Run ablation study comparing models with and without formation features.
+
+    Args:
+        raw_data: Raw player-match data
+        args: Command line arguments
+
+    Returns:
+        Dictionary with comparison results
+    """
+    logger.info("=" * 60)
+    logger.info("ABLATION STUDY: Formation Features Impact")
+    logger.info("=" * 60)
+
+    results_comparison = {}
+
+    # Train WITHOUT formation features
+    logger.info("\n[1/2] Training models WITHOUT formation features...")
+    config.model.use_formation_features = False
+
+    # Prepare features without formations
+    processed_data, X, feature_names, y, exposure = prepare_features(raw_data, use_formation_features=False)
+
+    logger.info(f"Features without formations: {len(feature_names)}")
+
+    # Split data
+    if exposure is not None:
+        X_train, X_test, y_train, y_test, exposure_train, exposure_test = train_test_split(
+            X, y, exposure, test_size=config.model.test_size, random_state=config.model.random_state
+        )
+    else:
+        X_train, X_test, y_train, y_test = train_test_split(
+            X, y, test_size=config.model.test_size, random_state=config.model.random_state
+        )
+        exposure_train = exposure_test = None
+
+    # Train models
+    models_without, results_without = train_models(
+        X_train, y_train, X_test, y_test,
+        exposure_train, exposure_test,
+        tune_xgb=False,  # Skip tuning for faster comparison
+        ensemble_type=args.ensemble
+    )
+
+    results_comparison['without_formations'] = results_without
+
+    # Train WITH formation features
+    logger.info("\n[2/2] Training models WITH formation features...")
+    config.model.use_formation_features = True
+
+    # Prepare features with formations
+    processed_data, X, feature_names, y, exposure = prepare_features(raw_data, use_formation_features=True)
+
+    logger.info(f"Features with formations: {len(feature_names)}")
+
+    # Split data (same seed for fair comparison)
+    if exposure is not None:
+        X_train, X_test, y_train, y_test, exposure_train, exposure_test = train_test_split(
+            X, y, exposure, test_size=config.model.test_size, random_state=config.model.random_state
+        )
+    else:
+        X_train, X_test, y_train, y_test = train_test_split(
+            X, y, test_size=config.model.test_size, random_state=config.model.random_state
+        )
+        exposure_train = exposure_test = None
+
+    # Train models
+    models_with, results_with = train_models(
+        X_train, y_train, X_test, y_test,
+        exposure_train, exposure_test,
+        tune_xgb=False,
+        ensemble_type=args.ensemble
+    )
+
+    results_comparison['with_formations'] = results_with
+
+    # Print comparison
+    logger.info("\n" + "=" * 60)
+    logger.info("ABLATION RESULTS: Formation Features Impact")
+    logger.info("=" * 60)
+
+    print("\n{:<25} {:>15} {:>15} {:>15}".format(
+        "Model", "Without Forms", "With Forms", "Improvement"
+    ))
+    print("-" * 70)
+
+    for model_name in results_without.keys():
+        mae_without = results_without[model_name]['mae']
+        mae_with = results_with[model_name]['mae']
+        improvement = mae_without - mae_with
+        pct_improvement = (improvement / mae_without) * 100
+
+        print("{:<25} {:>15.3f} {:>15.3f} {:>15.3f} ({:.1f}%)".format(
+            model_name, mae_without, mae_with, improvement, pct_improvement
+        ))
+
+    # Calculate average improvement
+    avg_improvement = []
+    for model in ['poisson', 'xgboost', 'position_specific']:
+        if model in results_without and model in results_with:
+            mae_diff = results_without[model]['mae'] - results_with[model]['mae']
+            avg_improvement.append((mae_diff / results_without[model]['mae']) * 100)
+
+    if avg_improvement:
+        print("\n" + "=" * 70)
+        print(f"Average improvement from formation features: {np.mean(avg_improvement):.1f}%")
+
+    return results_comparison
+
+
 def main(args):
     """Main training pipeline."""
     logger.info("Starting pass prediction model training")
@@ -418,9 +531,15 @@ def main(args):
         logger.info(f"Loading data from {data_path}")
         raw_data = pd.read_csv(data_path)
 
+    # Check if running ablation study
+    if args.ablation:
+        run_ablation_study(raw_data, args)
+        return
+
     # Step 2: Prepare features (without player-specific stats initially to avoid leakage)
     logger.info("Preparing features")
-    processed_data, X, feature_names, y, exposure = prepare_features(raw_data, None)
+    use_formations = config.model.use_formation_features if hasattr(config.model, 'use_formation_features') else False
+    processed_data, X, feature_names, y, exposure = prepare_features(raw_data, None, use_formations)
 
     logger.info(f"Dataset shape: {X.shape}")
     logger.info(f"Features: {feature_names}")
@@ -483,6 +602,8 @@ if __name__ == "__main__":
     parser.add_argument("--config", type=str, help="Path to config file")
     parser.add_argument("--competitions", type=str, help="Comma-separated list of competition_id:season_id pairs (e.g., '43:3,55:43')")
     parser.add_argument("--list-competitions", action="store_true", help="List available competitions and exit")
+    parser.add_argument("--ablation", action="store_true",
+                       help="Run ablation study comparing with/without formation features")
 
     args = parser.parse_args()
 

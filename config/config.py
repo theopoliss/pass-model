@@ -62,6 +62,9 @@ class ModelConfig(BaseModel):
     use_exposure: bool = Field(default=True, description="Use minutes as exposure")
     overdispersion: bool = Field(default=False, description="Use Negative Binomial instead of Poisson")
 
+    # Formation features flag
+    use_formation_features: bool = Field(default=True, description="Include tactical formation features")
+
 
 class DataConfig(BaseModel):
     """Data configuration."""
