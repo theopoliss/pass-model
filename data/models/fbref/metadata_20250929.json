@@ -1,0 +1,49 @@
+{
+  "timestamp": "20250929",
+  "models": [
+    "poisson_fbref",
+    "negbin_fbref",
+    "xgboost_fbref",
+    "ensemble_fbref"
+  ],
+  "features_used": [
+    "position_encoded",
+    "minutes_played",
+    "is_home",
+    "team_strength_diff",
+    "opponent_strength",
+    "player_career_avg_passes",
+    "player_career_passes_per90",
+    "player_pass_consistency",
+    "player_games_played",
+    "player_avg_xG",
+    "player_avg_xA",
+    "player_avg_touches",
+    "player_avg_progressive_passes",
+    "expected_involvement",
+    "progressive_rate",
+    "passes_attempted_rolling_5",
+    "form_trend",
+    "team_possession_style",
+    "is_possession_team",
+    "is_key_player",
+    "is_playmaker",
+    "player_quality_score",
+    "expected_pass_volume"
+  ],
+  "leagues": [
+    "Premier-League",
+    "La-Liga",
+    "Serie-A",
+    "Bundesliga",
+    "Ligue-1"
+  ],
+  "seasons": [
+    "2019-2020",
+    "2020-2021",
+    "2021-2022",
+    "2022-2023",
+    "2023-2024",
+    "2024-2025"
+  ]
+}
